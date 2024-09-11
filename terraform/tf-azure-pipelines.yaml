@@ -1,0 +1,653 @@
+trigger:
+ - none
+# - dev
+#  - master
+
+# Enable this when we want PR to master branch to trigger this pipeline e.g. PR from dev to master.
+# pr:
+#  - master
+
+parameters:
+  # - name: environment 
+  #   type: string
+  #   default: staging
+  #   displayName: "Select the environment"
+  #   values:
+  #   - dev
+  #   - qa
+  #   - uat
+  #   - staging
+  #   - prod
+
+  # - name: location
+  #   type: string
+  #   displayName: "Select the region"
+  #   default: westus3
+  #   values:
+  #     - westus
+  #     - westus3
+  #     - westus2
+  #     - westeurope
+  #     - eastus
+
+  - name: app_name
+    type: string
+    displayName: "API Name for Web App"
+    default: terraformado-app
+    
+  # - name: vnet_resource_group_name
+  #   type: string
+  #   displayName: "Resource group name of the existing VNet"
+  #   default: rg-stg-core-west3-001
+
+  # - name: vnet_name
+  #   type: string
+  #   displayName: "Name of the existing VNet"
+  #   default: vnet-stg-west-001
+
+  # - name: subnet_name
+  #   type: string
+  #   displayName: "Name of the existing Subnet"
+  #   default: snet-stg-api-west3-003
+
+variables:
+ - group: ADO-terraform
+ - name: buildConfiguration
+   value: 'Release'
+ - name: devClientBuildConfiguration
+   value: 'DEV'
+ - name: qaClientBuildConfiguration
+   value: 'QA'
+ - name: uatClientBuildConfiguration
+   value: 'UAT'
+ - name: prodClientBuildConfiguration
+   value: 'PROD'
+ - name: major
+   value: 1
+ - name: minor
+   value:  0
+ - name: restnumber
+   value:  0
+ - name: patch
+   value:  $[counter(variables['restnumber'], 0)]
+ - name: version
+   value: $(major).$(minor).$(patch)
+ - name: MEND_URL
+   value: https://saas.mend.io
+
+stages:
+# This build stage will be built based on the branch it is getting triggered from. If dev is triggering the pipeline then app build will happen based from dev branch code and if pipeline is getting triggered from master branch then app build will happen from master branch.
+  - stage: build
+    displayName: App Build
+    jobs:
+    - job: AppBuildJob
+      displayName: App Build job
+      pool:
+        vmImage: 'windows-latest'
+      steps:
+      - task: DotNetCoreCLI@2
+        displayName: 'dotnet restore'
+        inputs:
+          command: restore
+          projects: '**/*.csproj'
+
+      - task: DotNetCoreCLI@2
+        displayName: 'dotnet build'
+        inputs:
+          command: build
+          projects: '**/*.csproj'
+          arguments: '--configuration $(buildConfiguration) /p:clientConfiguration=$(devClientBuildConfiguration)'
+      - task: NuGetToolInstaller@1
+        inputs:
+          versionSpec: 
+          checkLatest: true
+
+      - task: DotNetCoreCLI@2
+        displayName: 'dotnet test'
+        inputs:
+          command: 'test'
+          projects: '**/*Test/*.csproj'
+          arguments: '--configuration $(buildConfiguration) --collect: "Code Coverage"'
+
+      - task: DotNetCoreCLI@2
+        displayName: 'DontNet Publish Task'
+        inputs:
+          command: 'publish'
+          publishWebProjects: true
+          arguments: '--configuration $(BuildConfiguration) --output $(Build.ArtifactStagingDirectory)'
+          modifyOutputPath: false
+      
+      - task: PowerShell@2
+        inputs:
+          targetType: 'inline'
+          script: |
+            ### Download the Mend Unified CLI ###
+            echo "Downloading Mend CLI"
+            Invoke-WebRequest -Uri "https://downloads.mend.io/cli/windows_amd64/mend.exe" -OutFile "mend.exe"
+            ### Run a Mend Software Composition Analysis Scan
+            echo "Run Mend dependencies scan"
+            ./mend.exe dep -u -s *//$(System.TeamProject)//$(Build.Repository.Name)_$(Build.SourceBranchName)
+            ### Run a Mend Static Application Security Analysis Scan
+            echo "Run Mend code scan"
+            ./mend.exe code -s *//$(System.TeamProject)//$(Build.Repository.Name)_$(Build.SourceBranchName)
+ 
+        env:
+          ### Authentication Environment Variable Secrets ###
+          MEND_EMAIL: $(MENDEMAIL)
+          MEND_USER_KEY: $(MENDUSERKEY)
+
+        displayName: 'Mend Unified CLI Scan'
+
+      - task: PublishBuildArtifacts@1
+        displayName: 'Publish App Artifacts'
+        inputs:
+          pathtoPublish: '$(Build.ArtifactStagingDirectory)' 
+          artifactName: 'Patelco.${{ parameters.app_name }}'
+
+      - task: UniversalPackages@0
+        displayName: 'Universal Package Publish'
+        inputs:
+          command: 'publish'
+          publishDirectory: '$(Build.ArtifactStagingDirectory)'
+          feedsToUsePublish: 'internal'
+          vstsFeedPublish: 'API-Development/PatelcoAPI'
+          vstsFeedPackagePublish: 'patelco.${{ parameters.app_name }}'
+          versionOption: 'major'
+          packagePublishDescription: 'Patelco ${{ parameters.app_name }} App'
+
+  - stage: Dev
+    displayName: 'Dev IaC & App Deploy'
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/dev'))
+    jobs:
+    - job: TerraformDevJob
+      displayName: Terraform Dev IaC Job
+      pool:
+        vmImage: 'ubuntu-latest'
+      steps:
+      - task: TerraformTaskV4@4
+        displayName: 'Terraform init'
+        inputs:
+          provider: 'azurerm'
+          command: 'init'
+          workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+          backendServiceArm: 'SC-PatelcoAPI-DevQA'
+          backendAzureRmResourceGroupName: 'rg-devtest-api-west'
+          backendAzureRmStorageAccountName: 'terraformstates011'
+          backendAzureRmContainerName: 'tfstatefiles'
+          backendAzureRmKey: '${{ parameters.app_name }}.tfstateenv:dev'
+
+      - task: TerraformTaskV4@4
+        displayName: 'Terraform validate'
+        inputs:
+          provider: 'azurerm'
+          command: 'validate'
+          workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+      
+      - task: TerraformTaskV4@4
+        displayName: 'Terraform plan'
+        inputs:
+          provider: 'azurerm'
+          command: 'plan'
+          workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+          commandOptions: '-var "app_name=${{ parameters.app_name }}" -var-file=environment/dev.tfvars -out=tfplan.out'
+          environmentServiceNameAzureRM: 'SC-PatelcoAPI-DevQA'
+
+      - task: TerraformTaskV4@4
+        displayName: 'Terraform apply'
+        inputs:
+          provider: 'azurerm'
+          command: 'apply'
+          workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+          commandOptions: 'tfplan.out'
+          environmentServiceNameAzureRM: 'SC-PatelcoAPI-DevQA'
+
+      - task: TerraformTaskV4@4
+        displayName: 'terraform output'
+        inputs:
+          provider: 'azurerm'
+          command: 'custom'
+          workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+          outputTo: 'file'
+          customCommand: 'output'
+          fileName: 'output.txt'
+          environmentServiceNameAzureRM: 'SC-PatelcoAPI-DevQA'
+              
+      - task: AzureCLI@2
+        displayName: 'Approve PrivateEndpoint'
+        inputs:
+          azureSubscription: 'SC-PatelcoAPI-DevQA'
+          scriptType: 'bash'
+          scriptLocation: 'inlineScript'
+          inlineScript: |
+            # Set Azure subscription to dev subscription
+            az account set --subscription f9bc5732-7fb9-45e7-9b27-8743dd20186a
+            
+            # Define variables
+            resourceGroupName="rg-dev-${{ parameters.app_name }}-westus"
+            webAppName="app-dev-${{ parameters.app_name }}-westus-001"
+                                
+            # Get web app details
+            webAppDetails=$(az webapp show --resource-group $resourceGroupName --name $webAppName)
+            
+            # Extract web app ID
+            webAppResourceId=$(echo $webAppDetails | jq -r '.id')
+            
+            # Print web app resource ID
+            echo "Web App ResourceID is -> $webAppResourceId"
+            
+            # Construct URI for Azure REST API call
+            uri="$webAppResourceId?api-version=2022-09-01"
+            echo "URI is -> $uri"
+            
+            # Fetch web app details using Azure REST API
+            webAppDetails=$(az rest --method get --uri $uri)
+            
+            # Print web app details
+            # echo "Web App Details: $webAppDetails"
+            
+            # Extract private endpoint name from web app details
+            privateEndpointId=$(echo $webAppDetails | jq -r '.properties.privateEndpointConnections[0].id')
+            echo "Private Endpoint ResourceID: $privateEndpointId"
+            
+            # Extract status for Private Endpoint connection
+            privateLinkServiceConnectionState=$(echo $webAppDetails | jq -r '.properties.privateEndpointConnections[0].properties.privateLinkServiceConnectionState.status')
+            echo "Private Endpoint Connection State: $privateLinkServiceConnectionState"
+            
+            # if private endpoint's status is pending then approve else do nothing
+            if [[ "$privateLinkServiceConnectionState" == "Pending" ]]; then
+              echo "Approving the private endpoint------------------"
+              az network private-endpoint-connection approve \
+                --id $privateEndpointId \
+                --description "Approved"
+            
+            else
+              echo "Private endpoint is already approved. No action needed."
+            fi
+
+      - task: Bash@3
+        displayName: 'check if tfplan file is present in terraform directory'
+        inputs:
+          targetType: 'inline'
+          script: |
+            echo "Listing files in $(System.DefaultWorkingDirectory)/terraform"
+            ls -l $(System.DefaultWorkingDirectory)/terraform
+      
+      - task: Bash@3
+        displayName: 'Check Terraform Plan Output'
+        inputs:
+          targetType: 'inline'
+          script: |
+            # jq is required to transform JSON data in human-readable plan output
+            echo "Installing jq."
+            sudo apt-get update
+            sudo apt-get install -y jq
+
+            echo "Navigating to terraform directory as tfplan.out file exists under /home/vsts/work/1/s/terraform, but the Check Terraform Plan Output task is looking in /home/vsts/work/1/s"
+            cd $(System.DefaultWorkingDirectory)/terraform
+            echo "Current directory: $(pwd)"
+            echo "Listing files:"
+            ls -la
+
+            if [ -f tfplan.out ]; then
+              echo "Generating human-readable plan output using terraform show."
+              terraform show -json tfplan.out > plan_output.json
+
+              echo "Inspecting plan_output.json for validity."
+              jq '.' plan_output.json
+
+              echo "Inspecting plan_output.json for changes."
+              # Check in the plan_output.json if there are any resource_changes that are "create" i.e. resource's action is create and IaC changes are there then set TF_PLAN_STATUS as created else set TF_PLAN_STATUS as not_created
+              if jq '[.resource_changes[] | select(.change.actions[] == "create")] | length > 0' plan_output.json | grep true; then
+                echo "IaC created in the TF Plan."
+                echo "##vso[task.setvariable variable=TF_PLAN_STATUS]created"
+              else
+                echo "No IaC created in the TF Plan."
+                echo "##vso[task.setvariable variable=TF_PLAN_STATUS]not_created"
+              fi
+            else
+              echo "TF Plan file does not exist."
+              echo "##vso[task.setvariable variable=TF_PLAN_STATUS]plan_not_found"
+            fi
+      
+      - script: |
+          echo "TF_PLAN_STATUS is: $(TF_PLAN_STATUS)"
+        name: TFPlanStatus
+
+      - task: SendGrid@1
+        displayName: 'SendEmail via SendGrid'
+        condition: and(succeeded(), eq(variables['TF_PLAN_STATUS'], 'created'))
+        inputs:
+          sendgridkey: '$(SENDGRIDKEY)'
+          to: 'neha.chauhan@patelco.org'
+          from: 'noreply@notifications.patelco.org'
+          subject: 'Successful ''app-dev-${{ parameters.app_name }}-westus-001'' web app deployment'
+          htmlbody: |
+            <html>
+            <body>
+            	<p>Hi Team,</p>
+            	<p></p>
+                <p>This is to inform you that Azure DevOps pipeline has successfully created WebApp 'app-dev-${{ parameters.app_name }}-westus-001' and application is also deployed. Please refer attachment for more details.</p>
+            	<p></p>
+                <p>Regards,</p>
+                <p>Neha</p>
+            </body>
+            </html>
+          addattachment: true
+          attachment: '$(System.DefaultWorkingDirectory)/output.txt' # this path is given as output.txt file is getting generated in /home/vsts/work/1/s and not in /home/vsts/work/1/s/terraform
+
+    - job: AppDeployDev
+      displayName: App deploy in Dev
+      dependsOn: TerraformDevJob
+      pool: 
+          vmImage: 'windows-latest'
+      steps:
+              - task: UniversalPackages@0
+                displayName: 'Universal Package download'
+                inputs:
+                  command: 'download'
+                  downloadDirectory: '$(System.DefaultWorkingDirectory)'
+                  feedsToUse: 'internal'
+                  vstsFeed: 'API-Development/PatelcoAPI'
+                  vstsFeedPackage: 'patelco.${{ parameters.app_name }}'
+                  vstsPackageVersion: '*'
+              
+              - task: AzureRmWebAppDeployment@4
+                displayName: 'App deploy in Dev webApp'
+                inputs:
+                  ConnectionType: 'AzureRM'
+                  azureSubscription: 'SC-PatelcoAPI-DevQA'
+                  appType: 'webApp'
+                  WebAppName: 'app-dev-${{ parameters.app_name }}-westus-001'
+                  packageForLinux: '$(System.DefaultWorkingDirectory)/**/*.zip'
+
+  # - stage: QA
+  #   displayName: 'QA IaC & App Deploy'
+  #   condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/dev'))
+  #   jobs:
+  #   - job: TerraformQAJob
+  #     displayName: Terraform QA IaC Job
+  #     pool:
+  #       vmImage: 'ubuntu-latest'
+  #     steps:
+  #     - task: TerraformTaskV4@4
+  #       displayName: 'Terraform init'
+  #       inputs:
+  #         provider: 'azurerm'
+  #         command: 'init'
+  #         workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+  #         backendServiceArm: 'SC-PatelcoAPI-DevQA'
+  #         backendAzureRmResourceGroupName: 'rg-devtest-api-west'
+  #         backendAzureRmStorageAccountName: 'terraformstates011'
+  #         backendAzureRmContainerName: 'tfstatefiles'
+  #         backendAzureRmKey: '${{ parameters.app_name }}.tfstateenv:qa'
+
+  #     - task: TerraformTaskV4@4
+  #       displayName: 'Terraform validate'
+  #       inputs:
+  #         provider: 'azurerm'
+  #         command: 'validate'
+  #         workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+
+  #     - task: TerraformTaskV4@4
+  #       displayName: 'Terraform plan'
+  #       inputs:
+  #         provider: 'azurerm'
+  #         command: 'plan'
+  #         workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+  #         commandOptions: '-var "app_name=${{ parameters.app_name }}" -var-file=environment/qa.tfvars -out=tfplan.out'
+  #         environmentServiceNameAzureRM: 'SC-PatelcoAPI-DevQA'
+      
+  #     - task: TerraformTaskV4@4
+  #       displayName: 'Terraform apply'
+  #       inputs:
+  #         provider: 'azurerm'
+  #         command: 'apply'
+  #         workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+  #         commandOptions: 'tfplan.out'
+  #         environmentServiceNameAzureRM: 'SC-PatelcoAPI-DevQA'
+                  
+  #     - task: TerraformTaskV4@4
+  #       displayName: 'terraform output'
+  #       inputs:
+  #         provider: 'azurerm'
+  #         command: 'custom'
+  #         workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+  #         outputTo: 'file'
+  #         customCommand: 'output'
+  #         fileName: 'output.txt'
+  #         environmentServiceNameAzureRM: 'SC-PatelcoAPI-DevQA'
+              
+  #     - task: AzureCLI@2
+  #       displayName: 'Approve PrivateEndpoint'
+  #       inputs:
+  #         azureSubscription: 'SC-PatelcoAPI-DevQA'
+  #         scriptType: 'bash'
+  #         scriptLocation: 'inlineScript'
+  #         inlineScript: |
+  #           # Set Azure subscription to dev subscription
+  #           az account set --subscription f9bc5732-7fb9-45e7-9b27-8743dd20186a
+            
+  #           # Define variables
+  #           resourceGroupName="rg-qa-${{ parameters.app_name }}-westus"
+  #           webAppName="app-qa-${{ parameters.app_name }}-westus-001"
+                                
+  #           # Get web app details
+  #           webAppDetails=$(az webapp show --resource-group $resourceGroupName --name $webAppName)
+            
+  #           # Extract web app ID
+  #           webAppResourceId=$(echo $webAppDetails | jq -r '.id')
+            
+  #           # Print web app resource ID
+  #           echo "Web App ResourceID is -> $webAppResourceId"
+            
+  #           # Construct URI for Azure REST API call
+  #           uri="$webAppResourceId?api-version=2022-09-01"
+  #           echo "URI is -> $uri"
+            
+  #           # Fetch web app details using Azure REST API
+  #           webAppDetails=$(az rest --method get --uri $uri)
+            
+  #           # Print web app details
+  #           # echo "Web App Details: $webAppDetails"
+            
+  #           # Extract private endpoint name from web app details
+  #           privateEndpointId=$(echo $webAppDetails | jq -r '.properties.privateEndpointConnections[0].id')
+  #           echo "Private Endpoint ResourceID: $privateEndpointId"
+            
+  #           # Extract status for Private Endpoint connection
+  #           privateLinkServiceConnectionState=$(echo $webAppDetails | jq -r '.properties.privateEndpointConnections[0].properties.privateLinkServiceConnectionState.status')
+  #           echo "Private Endpoint Connection State: $privateLinkServiceConnectionState"
+            
+  #           # if private endpoint's status is pending then approve else do nothing
+  #           if [[ "$privateLinkServiceConnectionState" == "Pending" ]]; then
+  #             echo "Approving the private endpoint------------------"
+  #             az network private-endpoint-connection approve \
+  #               --id $privateEndpointId \
+  #               --description "Approved"
+            
+  #           else
+  #             echo "Private endpoint is already approved. No action needed."
+  #           fi
+
+  #     - task: Bash@3
+  #       displayName: 'check if tfplan file is present in terraform directory'
+  #       inputs:
+  #         targetType: 'inline'
+  #         script: |
+  #           echo "Listing files in $(System.DefaultWorkingDirectory)/terraform"
+  #           ls -l $(System.DefaultWorkingDirectory)/terraform
+      
+  #     - task: Bash@3
+  #       displayName: 'Check Terraform Plan Output'
+  #       inputs:
+  #         targetType: 'inline'
+  #         script: |
+  #           # jq is required to transform JSON data in human-readable plan output
+  #           echo "Installing jq."
+  #           sudo apt-get update
+  #           sudo apt-get install -y jq
+
+  #           echo "Navigating to terraform directory as tfplan.out file exists under /home/vsts/work/1/s/terraform, but the Check Terraform Plan Output task is looking in /home/vsts/work/1/s"
+  #           cd $(System.DefaultWorkingDirectory)/terraform
+  #           echo "Current directory: $(pwd)"
+  #           echo "Listing files:"
+  #           ls -la
+
+  #           if [ -f tfplan.out ]; then
+  #             echo "Generating human-readable plan output using terraform show."
+  #             terraform show -json tfplan.out > plan_output.json
+
+  #             echo "Inspecting plan_output.json for validity."
+  #             jq '.' plan_output.json
+
+  #             echo "Inspecting plan_output.json for changes."
+  #             # Check in the plan_output.json if there are any resource_changes that are "create" i.e. resource's action is create and IaC changes are there then set TF_PLAN_STATUS as created else set TF_PLAN_STATUS as not_created
+  #             if jq '[.resource_changes[] | select(.change.actions[] == "create")] | length > 0' plan_output.json | grep true; then
+  #               echo "IaC created in the TF Plan."
+  #               echo "##vso[task.setvariable variable=TF_PLAN_STATUS]created"
+  #             else
+  #               echo "No IaC created in the TF Plan."
+  #               echo "##vso[task.setvariable variable=TF_PLAN_STATUS]not_created"
+  #             fi
+  #           else
+  #             echo "TF Plan file does not exist."
+  #             echo "##vso[task.setvariable variable=TF_PLAN_STATUS]plan_not_found"
+  #           fi
+      
+  #     - script: |
+  #         echo "TF_PLAN_STATUS is: $(TF_PLAN_STATUS)"
+  #       name: TFPlanStatus
+
+  #     - task: SendGrid@1
+  #       displayName: 'SendEmail via SendGrid'
+  #       condition: and(succeeded(), eq(variables['TF_PLAN_STATUS'], 'created'))
+  #       inputs:
+  #         sendgridkey: '$(SENDGRIDKEY)'
+  #         to: 'neha.chauhan@patelco.org'
+  #         from: 'noreply@notifications.patelco.org'
+  #         subject: 'Successful ''app-qa-${{ parameters.app_name }}-westus-001'' web app deployment'
+  #         htmlbody: |
+  #           <html>
+  #           <body>
+  #           	<p>Hi Team,</p>
+  #           	<p></p>
+  #               <p>This is to inform you that Azure DevOps pipeline has successfully created WebApp 'app-qa-${{ parameters.app_name }}-westus-001' using Terraform. Please refer attachment for more details.</p>
+  #           	<p></p>
+  #               <p>Regards,</p>
+  #               <p>Neha</p>
+  #           </body>
+  #           </html>
+  #         addattachment: true
+  #         attachment: '$(System.DefaultWorkingDirectory)/output.txt'
+    
+    # - job: AppDeployQA
+    #   displayName: App deploy in QA
+    #   dependsOn: TerraformQAJob
+    #   pool: 
+    #       vmImage: 'windows-latest'
+    #   steps:
+    #           - task: UniversalPackages@0
+    #             displayName: 'Universal Package download'
+    #             inputs:
+    #               command: 'download'
+    #               downloadDirectory: '$(System.DefaultWorkingDirectory)'
+    #               feedsToUse: 'internal'
+    #               vstsFeed: 'API-Development/PatelcoAPI'
+    #               vstsFeedPackage: 'patelco.${{ parameters.app_name }}'
+    #               vstsPackageVersion: '*'
+
+    #           - task: AzureRmWebAppDeployment@4
+    #             displayName: 'App deploy in QA webApp'
+    #             inputs:
+    #               ConnectionType: 'AzureRM'
+    #               azureSubscription: 'SC-PatelcoAPI-DevQA'
+    #               appType: 'webApp'
+    #               WebAppName: 'app-qa-${{ parameters.app_name }}-westus-001'
+    #               packageForLinux: '$(System.DefaultWorkingDirectory)/**/*.zip'
+  
+  - stage: DestroyDev
+    displayName: "Destroy Dev IaC"
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/dev'))
+    pool:
+        vmImage: ubuntu-latest
+
+    jobs:
+      - deployment: DeploymentJob
+        displayName: 'Terraform Destroy'
+        environment: 'terraform'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+
+              # - task: Bash@3
+              #   inputs:
+              #     targetType: 'inline'
+              #     script: |
+              #       ls                    
+              #       echo '$(System.DefaultWorkingDirectory)/terraform'
+
+              # checkout task is added so that terraform init can take up the tf files from github root directory as in above first 3 stages checkout was auto-done but in this stage had to add this task explicitly else terraform init task was giving error as "There was an error when attempting to execute the process '/usr/local/bin/terraform'. This may indicate the process failed to start. Error: spawn /usr/local/bin/terraform ENOENT"
+              - checkout: self  # self represents the repo where the initial Pipelines YAML file was found
+                clean: true
+                fetchDepth: 5
+                lfs: true
+
+              - task: TerraformTaskV4@4
+                displayName: 'Terraform init'
+                inputs:
+                  provider: 'azurerm'
+                  command: 'init'
+                  workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+                  backendServiceArm: 'SC-PatelcoAPI-DevQA'
+                  backendAzureRmResourceGroupName: 'rg-devtest-api-west'
+                  backendAzureRmStorageAccountName: 'terraformstates011'
+                  backendAzureRmContainerName: 'tfstatefiles'
+                  backendAzureRmKey: '${{ parameters.app_name }}.tfstateenv:dev'
+              - task: TerraformTaskV4@4
+                displayName: 'Terraform Destroy'
+                inputs:
+                  provider: 'azurerm'
+                  command: 'destroy'
+                  workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+                  commandOptions: '-var "app_name=${{ parameters.app_name }}" -var-file=environment/dev.tfvars'
+                  environmentServiceNameAzureRM: 'SC-PatelcoAPI-DevQA'
+
+  # - stage: DestroyQA
+  #   displayName: "Destroy QA IaC"
+  #   condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/dev'))
+  #   pool:
+  #       vmImage: ubuntu-latest
+  #   jobs:
+  #     - deployment: DeploymentJob
+  #       displayName: 'Terraform Destroy'
+  #       environment: 'terraform'
+  #       strategy:
+  #         runOnce:
+  #           deploy:
+  #             steps:
+
+  #             # checkout task is added so that terraform init can take up the tf files from github root directory as in above first 3 stages checkout was auto-done but in this stage had to add this task explicitly else terraform init task was giving error as "There was an error when attempting to execute the process '/usr/local/bin/terraform'. This may indicate the process failed to start. Error: spawn /usr/local/bin/terraform ENOENT"
+  #             - checkout: self  # self represents the repo where the initial Pipelines YAML file was found
+  #               clean: true
+  #               fetchDepth: 5
+  #               lfs: true
+  #             - task: TerraformTaskV4@4
+  #               displayName: 'Terraform init'
+  #               inputs:
+  #                 provider: 'azurerm'
+  #                 command: 'init'
+  #                 workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+  #                 backendServiceArm: 'SC-PatelcoAPI-DevQA'
+  #                 backendAzureRmResourceGroupName: 'rg-devtest-api-west'
+  #                 backendAzureRmStorageAccountName: 'terraformstates011'
+  #                 backendAzureRmContainerName: 'tfstatefiles'
+  #                 backendAzureRmKey: '${{ parameters.app_name }}.tfstateenv:qa'
+  #             - task: TerraformTaskV4@4
+  #               displayName: 'Terraform Destroy'
+  #               inputs:
+  #                 provider: 'azurerm'
+  #                 command: 'destroy'
+  #                 workingDirectory: '$(System.DefaultWorkingDirectory)/terraform'
+  #                 commandOptions: '-var "app_name=${{ parameters.app_name }}" -var-file=environment/qa.tfvars'
+  #                 environmentServiceNameAzureRM: 'SC-PatelcoAPI-DevQA'
